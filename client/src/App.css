@@ -344,9 +344,12 @@
 .camera-video {
   width: 100%;
   max-width: 640px;
+  height: auto;
+  min-height: 480px;
   border-radius: 16px;
   background: #000;
   box-shadow: var(--shadow-xl);
+  object-fit: cover;
 }
 
 .camera-controls {

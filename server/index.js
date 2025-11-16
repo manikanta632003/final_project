@@ -149,7 +149,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   const requestId = req.body.requestId || `req-${Date.now()}`;
   
   try {
-    const { message, sessionId, autoAnalyze } = req.body;
+    const { message, sessionId, autoAnalyze, language } = req.body;
     const files = req.files || [];
 
     if (!message && files.length === 0) {
@@ -167,8 +167,33 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
 
     const conversationHistory = conversations.get(sessionId);
 
-    // Prepare user parts for Gemini
-    const userParts = [{ text: message || 'Please analyze these files.' }];
+    // Map language codes to full language names
+    const languageMap = {
+      'en-US': 'English',
+      'en-IN': 'English',
+      'hi-IN': 'Hindi',
+      'kn-IN': 'Kannada',
+      'te-IN': 'Telugu',
+      'ta-IN': 'Tamil',
+      'mr-IN': 'Marathi',
+      'gu-IN': 'Gujarati',
+      'bn-IN': 'Bengali',
+      'pa-IN': 'Punjabi'
+    };
+
+    const targetLanguage = language && languageMap[language] ? languageMap[language] : 'English';
+    
+    console.log(`Request language: ${language}, Target language: ${targetLanguage}`);
+
+    // Prepare user parts for Gemini with language instruction
+    let userMessage = message || 'Please analyze these files.';
+    
+    // Add strong language instruction if not English - ALWAYS add it to ensure correct language
+    if (targetLanguage !== 'English') {
+      userMessage = `[RESPOND IN ${targetLanguage} ONLY - NOT ENGLISH] ${userMessage}`;
+    }
+    
+    const userParts = [{ text: userMessage }];
 
     // Process all uploaded files
     const fileCleanup = [];
@@ -209,13 +234,30 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     }
 
     // Build conversation history for Gemini
-    const geminiHistory = conversationHistory.map(msg => {
+    let geminiHistory = conversationHistory.map(msg => {
       if (msg.role === 'user') {
         return { role: 'user', parts: msg.parts };
       } else {
         return { role: 'model', parts: msg.parts };
       }
     });
+
+    // Add language instruction at the beginning of EVERY session if not English
+    // This ensures the AI always knows what language to use
+    if (targetLanguage !== 'English') {
+      // Add primer messages at the start (won't be saved to conversationHistory)
+      geminiHistory = [
+        {
+          role: 'user',
+          parts: [{ text: `You must ALWAYS respond in ${targetLanguage} language. NEVER use English.` }]
+        },
+        {
+          role: 'model',
+          parts: [{ text: `I will respond only in ${targetLanguage}.` }]
+        },
+        ...geminiHistory
+      ];
+    }
 
     // Start or continue chat with history
     const chat = model.startChat({
@@ -305,7 +347,9 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       if (suggestions.length === 0) {
         try {
           const suggestionModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-          const suggestionPrompt = `Based on this image analysis: "${assistantMessage.substring(0, 500)}", generate exactly 3-5 short, specific questions a user might ask about this image. Return only the questions, one per line, without numbering or bullets.`;
+          const suggestionPrompt = targetLanguage !== 'English'
+            ? `Based on this image analysis: "${assistantMessage.substring(0, 500)}", generate exactly 3-5 short, specific questions a user might ask about this image. Return only the questions in ${targetLanguage} language, one per line, without numbering or bullets.`
+            : `Based on this image analysis: "${assistantMessage.substring(0, 500)}", generate exactly 3-5 short, specific questions a user might ask about this image. Return only the questions, one per line, without numbering or bullets.`;
           const suggestionResult = await suggestionModel.generateContent(suggestionPrompt);
           const suggestionText = suggestionResult.response.text();
           suggestions = suggestionText.split('\n')
@@ -751,10 +795,15 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Server is running' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  if (!process.env.GEMINI_API_KEY) {
-    console.warn('Warning: GEMINI_API_KEY not set in environment variables');
-  }
-});
+// Export app for Vercel serverless functions
+module.exports = app;
+
+// Start server only if not in serverless environment
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    if (!process.env.GEMINI_API_KEY) {
+      console.warn('Warning: GEMINI_API_KEY not set in environment variables');
+    }
+  });
+}

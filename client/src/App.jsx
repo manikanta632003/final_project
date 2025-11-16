@@ -20,7 +20,6 @@ function App() {
   const [speechSupported, setSpeechSupported] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [inputLanguage, setInputLanguage] = useState('en-US');
-  const [outputLanguage, setOutputLanguage] = useState('en-US');
   const [voiceGender, setVoiceGender] = useState('female'); // 'male' or 'female'
   
   const fileInputRef = useRef(null);
@@ -75,7 +74,201 @@ function App() {
         localStorage.removeItem('user');
       }
     }
-  }, []);
+    
+    // Initialize speech recognition immediately (don't wait for login)
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    console.log('Checking Speech Recognition support...');
+    console.log('window.SpeechRecognition:', window.SpeechRecognition);
+    console.log('window.webkitSpeechRecognition:', window.webkitSpeechRecognition);
+    console.log('Is Secure Context:', window.isSecureContext);
+    console.log('Location:', window.location.hostname);
+    
+    if (SpeechRecognition) {
+      console.log('✅ Speech Recognition API available - initializing...');
+      setSpeechSupported(true);
+      
+      try {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.lang = inputLanguage;
+        recognition.maxAlternatives = 1;
+
+        recognition.onstart = () => {
+          console.log('Voice recognition started');
+          setIsListening(true);
+          isListeningRef.current = true;
+          fullTranscriptRef.current = '';
+          setInput('');
+        };
+
+        recognition.onresult = (event) => {
+          let finalTranscript = '';
+          let interimTranscript = '';
+
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              finalTranscript += transcript + ' ';
+              fullTranscriptRef.current += transcript + ' ';
+            } else {
+              interimTranscript += transcript;
+            }
+          }
+
+          const displayText = fullTranscriptRef.current + (interimTranscript ? interimTranscript : '');
+          setInput(displayText);
+          console.log('Transcript updated:', displayText);
+        };
+
+        recognition.onerror = (event) => {
+          console.error('Speech recognition error:', event.error, event);
+          setIsListening(false);
+          isListeningRef.current = false;
+          
+          if (event.error === 'not-allowed') {
+            alert('Microphone permission denied. Please:\n1. Click the lock icon in your browser address bar\n2. Allow microphone access\n3. Refresh the page');
+          } else if (event.error === 'no-speech') {
+            console.log('No speech detected');
+          } else if (event.error === 'audio-capture') {
+            alert('No microphone found. Please connect a microphone.');
+          } else if (event.error === 'network') {
+            alert('⚠️ Network Error\n\nVoice input requires internet connection.');
+          }
+          setInput(prev => prev.replace(' [listening...]', '').trim());
+        };
+
+        recognition.onend = () => {
+          console.log('Voice recognition ended. Transcript:', fullTranscriptRef.current);
+          const transcript = fullTranscriptRef.current.trim();
+          
+          if (isListeningRef.current && transcript) {
+            setIsListening(false);
+            isListeningRef.current = false;
+            setInput(transcript);
+            
+            // Auto-send after voice input
+            setTimeout(() => {
+              const userMessage = transcript;
+              setInput('');
+              
+              const currentFiles = selectedFilesRef.current;
+              const currentPreviews = filePreviewsRef.current;
+              
+              setMessages(prev => [...prev, {
+                type: 'user',
+                content: userMessage || (currentFiles.length > 0 ? `${currentFiles.length} file(s) uploaded` : ''),
+                files: currentPreviews.map(p => p.preview || p.name)
+              }]);
+
+              setIsLoading(true);
+              const requestId = `req-${Date.now()}-${Math.random()}`;
+              setCurrentRequestId(requestId);
+              abortControllerRef.current = new AbortController();
+
+              const formData = new FormData();
+              currentFiles.forEach(file => {
+                formData.append('files', file);
+              });
+              
+              if (userMessage) {
+                formData.append('message', userMessage);
+              }
+              formData.append('sessionId', sessionId);
+              formData.append('requestId', requestId);
+              formData.append('language', inputLanguage); // Send input language
+
+              axios.post('/api/chat', formData, {
+                headers: {
+                  'Content-Type': 'multipart/form-data',
+                },
+                signal: abortControllerRef.current.signal,
+              }).then(response => {
+                const assistantMsg = {
+                  type: 'assistant',
+                  content: response.data.response,
+                  suggestions: response.data.suggestions || []
+                };
+                setMessages(prev => [...prev, assistantMsg]);
+                
+                setTimeout(() => {
+                  speakText(response.data.response);
+                }, 500);
+              }).catch(error => {
+                if (error.name !== 'AbortError' && error.name !== 'CanceledError') {
+                  if (error.response && error.response.status === 429) {
+                    const retryAfter = error.response.data?.retryAfter || 60;
+                    setMessages(prev => [...prev, {
+                      type: 'assistant',
+                      content: `⚠️ Rate limit exceeded. Please wait ${retryAfter} seconds before trying again.`
+                    }]);
+                  } else {
+                    setMessages(prev => [...prev, {
+                      type: 'assistant',
+                      content: error.response?.data?.message || 'Sorry, I encountered an error. Please try again.'
+                    }]);
+                  }
+                }
+              }).finally(() => {
+                setIsLoading(false);
+                setCurrentRequestId(null);
+                abortControllerRef.current = null;
+                
+                setSelectedFiles([]);
+                setFilePreviews([]);
+                if (fileInputRef.current) {
+                  fileInputRef.current.value = '';
+                }
+              });
+            }, 500);
+          } else if (isListeningRef.current && !transcript) {
+            console.log('No speech detected, restarting...');
+            setTimeout(() => {
+              try {
+                if (isListeningRef.current) {
+                  recognition.start();
+                }
+              } catch (error) {
+                console.error('Error restarting recognition:', error);
+                setIsListening(false);
+                isListeningRef.current = false;
+              }
+            }, 100);
+          } else {
+            setIsListening(false);
+            isListeningRef.current = false;
+          }
+        };
+
+        recognitionRef.current = recognition;
+        console.log('✅ Speech recognition initialized successfully');
+      } catch (error) {
+        console.error('Failed to create SpeechRecognition:', error);
+        setSpeechSupported(false);
+      }
+    } else {
+      console.log('❌ Speech Recognition NOT available in this browser');
+      setSpeechSupported(false);
+    }
+    
+    // Initialize Speech Synthesis (Text-to-Speech)
+    if ('speechSynthesis' in window) {
+      speechSynthesisRef.current = window.speechSynthesis;
+      console.log('Speech Synthesis (TTS) available');
+      
+      const loadVoices = () => {
+        const voices = speechSynthesisRef.current.getVoices();
+        console.log('Available voices:', voices.length);
+      };
+      
+      if (speechSynthesisRef.current.onvoiceschanged !== undefined) {
+        speechSynthesisRef.current.onvoiceschanged = loadVoices;
+      }
+      loadVoices();
+    } else {
+      console.warn('Speech Synthesis not supported in this browser');
+    }
+  }, [inputLanguage, sessionId]);
 
   useEffect(() => {
     if (!user) return;
@@ -92,238 +285,7 @@ function App() {
         console.error('Error loading saved chat:', e);
       }
     }
-
-    // Check if speech recognition is supported
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    console.log('Speech Recognition available:', !!SpeechRecognition);
-    console.log('Browser:', navigator.userAgent);
-    
-    if (SpeechRecognition) {
-      setSpeechSupported(true);
-      let recognition;
-      try {
-        recognition = new SpeechRecognition();
-      } catch (error) {
-        console.error('Failed to create SpeechRecognition:', error);
-        setSpeechSupported(false);
-        return;
-      }
-      recognition.continuous = false; // Stop after speech ends to auto-send
-      recognition.interimResults = true; // Show interim results in real-time
-      recognition.lang = inputLanguage;
-      recognition.maxAlternatives = 1; // Only get the best result
-
-      recognition.onstart = () => {
-        console.log('Voice recognition started');
-        setIsListening(true);
-        isListeningRef.current = true;
-        fullTranscriptRef.current = ''; // Reset transcript when starting
-        setInput(''); // Clear input when starting
-      };
-
-      recognition.onresult = (event) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
-
-        // Process all results from the current event
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript + ' ';
-            fullTranscriptRef.current += transcript + ' '; // Add to ref
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-
-        // Update input with all final text plus current interim results
-        const displayText = fullTranscriptRef.current + (interimTranscript ? interimTranscript : '');
-        setInput(displayText);
-        console.log('Transcript updated:', displayText);
-      };
-
-      recognition.onerror = (event) => {
-        console.error('Speech recognition error:', event.error, event);
-        setIsListening(false);
-        isListeningRef.current = false;
-        
-        // Handle different error types
-        if (event.error === 'not-allowed') {
-          alert('Microphone permission denied. Please:\n1. Click the lock icon in your browser address bar\n2. Allow microphone access\n3. Refresh the page');
-          setInput(prev => prev.replace(' [listening...]', '').trim());
-        } else if (event.error === 'aborted') {
-          // User manually stopped - this is normal, no alert needed
-          console.log('Recognition aborted by user');
-          setInput(prev => prev.replace(' [listening...]', '').trim());
-        } else if (event.error === 'no-speech') {
-          // No speech detected - this is normal, no alert needed
-          console.log('No speech detected - this is normal if you didn\'t speak');
-          setInput(prev => {
-            const text = prev.replace(' [listening...]', '').trim();
-            return text || ''; // Keep existing text or clear if empty
-          });
-        } else if (event.error === 'audio-capture') {
-          alert('No microphone found. Please:\n1. Connect a microphone\n2. Check system settings\n3. Try again');
-          setInput(prev => prev.replace(' [listening...]', '').trim());
-        } else if (event.error === 'network') {
-          // Network error - Web Speech API requires internet connection
-          console.warn('Network error in speech recognition');
-          alert('⚠️ Network Error\n\nVoice input requires an active internet connection.\n\nSpeech recognition is processed on remote servers (Google/Apple), so you need:\n- A stable internet connection\n- No firewall blocking the connection\n- Access to speech recognition services\n\nPlease:\n1. Check your internet connection\n2. Make sure you\'re online\n3. Try again in a moment');
-          setInput(prev => prev.replace(' [listening...]', '').trim());
-        } else if (event.error === 'service-not-allowed') {
-          alert('Speech recognition service is not available. Please try a different browser (Chrome, Edge, or Safari).');
-          setInput(prev => prev.replace(' [listening...]', '').trim());
-        } else {
-          console.error('Unknown speech recognition error:', event.error);
-          // Only show alert for critical errors
-          if (event.error && !['no-speech', 'aborted'].includes(event.error)) {
-            console.warn('Speech recognition error:', event.error, '- Check console for details');
-          }
-          setInput(prev => prev.replace(' [listening...]', '').trim());
-        }
-      };
-
-      recognition.onend = () => {
-        console.log('Voice recognition ended. Transcript:', fullTranscriptRef.current);
-        const transcript = fullTranscriptRef.current.trim();
-        
-        // If we have text and were listening, auto-send the message
-        if (isListeningRef.current && transcript) {
-          setIsListening(false);
-          isListeningRef.current = false;
-          
-          // Set the final transcript
-          setInput(transcript);
-          
-          // Auto-send the message after a short delay
-          setTimeout(() => {
-            const userMessage = transcript;
-            setInput('');
-            
-            // Get current files from refs to ensure we have the latest values
-            const currentFiles = selectedFilesRef.current;
-            const currentPreviews = filePreviewsRef.current;
-            
-            // Add user message to chat with files
-            setMessages(prev => [...prev, {
-              type: 'user',
-              content: userMessage || (currentFiles.length > 0 ? `${currentFiles.length} file(s) uploaded` : ''),
-              files: currentPreviews.map(p => p.preview || p.name)
-            }]);
-
-            setIsLoading(true);
-            const requestId = `req-${Date.now()}-${Math.random()}`;
-            setCurrentRequestId(requestId);
-            abortControllerRef.current = new AbortController();
-
-            // Send the message with files
-            const formData = new FormData();
-            
-            // Append all files
-            currentFiles.forEach(file => {
-              formData.append('files', file);
-            });
-            
-            if (userMessage) {
-              formData.append('message', userMessage);
-            }
-            formData.append('sessionId', sessionId);
-            formData.append('requestId', requestId);
-
-            axios.post('/api/chat', formData, {
-              headers: {
-                'Content-Type': 'multipart/form-data',
-              },
-              signal: abortControllerRef.current.signal,
-            }).then(response => {
-              const assistantMsg = {
-                type: 'assistant',
-                content: response.data.response,
-                suggestions: response.data.suggestions || []
-              };
-              setMessages(prev => [...prev, assistantMsg]);
-              
-              // Automatically speak the assistant's response
-              setTimeout(() => {
-                speakText(response.data.response);
-              }, 500);
-            }).catch(error => {
-              if (error.name !== 'AbortError' && error.name !== 'CanceledError') {
-                if (error.response && error.response.status === 429) {
-                  const retryAfter = error.response.data?.retryAfter || 60;
-                  setMessages(prev => [...prev, {
-                    type: 'assistant',
-                    content: `⚠️ Rate limit exceeded. Please wait ${retryAfter} seconds before trying again.`
-                  }]);
-                } else {
-                  setMessages(prev => [...prev, {
-                    type: 'assistant',
-                    content: error.response?.data?.message || 'Sorry, I encountered an error. Please try again.'
-                  }]);
-                }
-              }
-            }).finally(() => {
-              setIsLoading(false);
-              setCurrentRequestId(null);
-              abortControllerRef.current = null;
-              
-              // Clear file selection after sending
-              setSelectedFiles([]);
-              setFilePreviews([]);
-              if (fileInputRef.current) {
-                fileInputRef.current.value = '';
-              }
-            });
-          }, 500);
-        } else if (isListeningRef.current && !transcript) {
-          // Still listening but no speech detected yet, restart
-          console.log('No speech detected, restarting...');
-          setTimeout(() => {
-            try {
-              if (isListeningRef.current) {
-                recognition.start();
-              }
-            } catch (error) {
-              console.error('Error restarting recognition:', error);
-              setIsListening(false);
-              isListeningRef.current = false;
-            }
-          }, 100);
-        } else {
-          // User manually stopped or no transcript
-          console.log('Voice recognition stopped');
-          setIsListening(false);
-          isListeningRef.current = false;
-        }
-      };
-
-      recognitionRef.current = recognition;
-      console.log('Speech recognition initialized successfully');
-    } else {
-      console.warn('Speech Recognition not supported in this browser');
-      console.log('Supported browsers: Chrome, Edge, Safari');
-    }
-    
-    // Initialize Speech Synthesis (Text-to-Speech)
-    if ('speechSynthesis' in window) {
-      speechSynthesisRef.current = window.speechSynthesis;
-      console.log('Speech Synthesis (TTS) available');
-      
-      // Load voices (some browsers need this)
-      const loadVoices = () => {
-        const voices = speechSynthesisRef.current.getVoices();
-        console.log('Available voices:', voices.length);
-      };
-      
-      // Chrome loads voices asynchronously
-      if (speechSynthesisRef.current.onvoiceschanged !== undefined) {
-        speechSynthesisRef.current.onvoiceschanged = loadVoices;
-      }
-      loadVoices();
-    } else {
-      console.warn('Speech Synthesis not supported in this browser');
-    }
-  }, [inputLanguage]);
+  }, [user, sessionId]);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -432,6 +394,7 @@ function App() {
       formData.append('sessionId', sessionId);
       formData.append('requestId', requestId);
       formData.append('autoAnalyze', 'true'); // Flag for auto-analysis
+      formData.append('language', inputLanguage); // Send input language
 
       const response = await axios.post('/api/chat', formData, {
         headers: {
@@ -489,14 +452,81 @@ function App() {
 
   const startCamera = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      cameraStreamRef.current = stream;
-      if (cameraVideoRef.current) {
-        cameraVideoRef.current.srcObject = stream;
-      }
+      console.log('🎥 Requesting camera access...');
+      
+      // First show the camera modal
       setShowCamera(true);
+      
+      // Small delay to ensure video element is rendered
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Request camera stream
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { 
+          facingMode: 'user',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        } 
+      });
+      
+      console.log('✅ Camera stream obtained');
+      cameraStreamRef.current = stream;
+      
+      // Wait for video element to be available
+      let attempts = 0;
+      while (!cameraVideoRef.current && attempts < 10) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        attempts++;
+      }
+      
+      if (!cameraVideoRef.current) {
+        throw new Error('Video element not found');
+      }
+      
+      console.log('✅ Video element found, attaching stream...');
+      
+      // Attach stream to video element
+      cameraVideoRef.current.srcObject = stream;
+      
+      // Wait for metadata to load
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Video loading timeout')), 5000);
+        
+        cameraVideoRef.current.onloadedmetadata = () => {
+          clearTimeout(timeout);
+          console.log('✅ Video metadata loaded');
+          resolve();
+        };
+      });
+      
+      // Play the video
+      await cameraVideoRef.current.play();
+      
+      console.log('✅ Camera ready and playing:', {
+        width: cameraVideoRef.current.videoWidth,
+        height: cameraVideoRef.current.videoHeight,
+        readyState: cameraVideoRef.current.readyState
+      });
+      
     } catch (error) {
-      alert('Error accessing camera: ' + error.message);
+      console.error('❌ Camera error:', error);
+      setShowCamera(false);
+      
+      if (error.name === 'NotAllowedError') {
+        alert('❌ Camera Access Denied\n\nPlease:\n1. Click the camera icon 🎥 in your browser address bar\n2. Allow camera permission\n3. Refresh the page and try again');
+      } else if (error.name === 'NotFoundError') {
+        alert('❌ No camera found on this device.');
+      } else if (error.message === 'Video loading timeout') {
+        alert('⏱️ Camera timeout. Please check if:\n1. Your camera is working\n2. No other app is using the camera\n3. Try refreshing the page');
+      } else {
+        alert('❌ Camera Error: ' + error.message);
+      }
+      
+      // Clean up stream if error occurred
+      if (cameraStreamRef.current) {
+        cameraStreamRef.current.getTracks().forEach(track => track.stop());
+        cameraStreamRef.current = null;
+      }
     }
   };
 
@@ -509,54 +539,60 @@ function App() {
   };
 
   const capturePhoto = () => {
-    if (cameraVideoRef.current && cameraVideoRef.current.readyState === 4) {
-      const video = cameraVideoRef.current;
-      const videoWidth = video.videoWidth;
-      const videoHeight = video.videoHeight;
-      
-      if (videoWidth === 0 || videoHeight === 0) {
-        alert('Camera is not ready. Please wait a moment and try again.');
+    const video = cameraVideoRef.current;
+    
+    if (!video) {
+      alert('Camera not available.');
+      return;
+    }
+    
+    // Use actual dimensions or default to 1280x720 (as per memory guidance)
+    const videoWidth = video.videoWidth || 1280;
+    const videoHeight = video.videoHeight || 720;
+    
+    console.log('📸 Capturing from video:', {
+      actualWidth: video.videoWidth,
+      actualHeight: video.videoHeight,
+      usingWidth: videoWidth,
+      usingHeight: videoHeight,
+      readyState: video.readyState
+    });
+    
+    // Create canvas and capture frame
+    const canvas = document.createElement('canvas');
+    canvas.width = videoWidth;
+    canvas.height = videoHeight;
+    const ctx = canvas.getContext('2d');
+    
+    // Draw the current video frame
+    ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
+    
+    console.log('✅ Photo captured successfully');
+    
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        alert('Failed to capture photo. Please try again.');
         return;
       }
       
-      const canvas = document.createElement('canvas');
-      canvas.width = videoWidth;
-      canvas.height = videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
+      const file = new File([blob], `camera-${Date.now()}.jpg`, { type: 'image/jpeg' });
+      const newFiles = [...selectedFiles, file];
+      setSelectedFiles(newFiles);
       
-      canvas.toBlob((blob) => {
-        if (!blob) {
-          alert('Failed to capture photo. Please try again.');
-          return;
-        }
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const newPreviews = [...filePreviews, { file, preview: reader.result, type: 'image' }];
+        setFilePreviews(newPreviews);
         
-        const file = new File([blob], `camera-${Date.now()}.jpg`, { type: 'image/jpeg' });
-        const newFiles = [...selectedFiles, file];
-        setSelectedFiles(newFiles);
+        console.log('✅ Analyzing photo...');
         
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const newPreviews = [...filePreviews, { file, preview: reader.result, type: 'image' }];
-          setFilePreviews(newPreviews);
-          
-          // Auto-analyze if no text input
-          if (!input.trim()) {
-            setTimeout(() => {
-              autoAnalyzeImages([file]);
-            }, 500);
-          }
-        };
-        reader.onerror = () => {
-          alert('Failed to read captured photo.');
-        };
-        reader.readAsDataURL(file);
-        
-        stopCamera();
-      }, 'image/jpeg', 0.9);
-    } else {
-      alert('Camera is not ready. Please wait a moment and try again.');
-    }
+        // Auto-analyze immediately - no delay
+        autoAnalyzeImages([file]);
+      };
+      reader.readAsDataURL(file);
+      
+      stopCamera();
+    }, 'image/jpeg', 0.95);
   };
 
   const stopRequest = async () => {
@@ -584,29 +620,39 @@ function App() {
 
     // Clean text - remove markdown and special characters for better speech
     const cleanText = text
+      .replace(/\[RESPOND IN .*?\]\s*/g, '') // Remove language instructions (new format)
+      .replace(/\[You must.*?\]\s*/g, '') // Remove language instructions (old format)
       .replace(/[#*_`]/g, '') // Remove markdown
       .replace(/\n+/g, '. ') // Replace newlines with periods
       .trim();
 
     if (!cleanText) {
+      console.warn('No text to speak');
       return;
     }
 
+    console.log('Speaking text in language:', inputLanguage);
+    console.log('Text to speak:', cleanText.substring(0, 100) + '...');
+
     const utterance = new SpeechSynthesisUtterance(cleanText);
-    utterance.lang = outputLanguage;
+    utterance.lang = inputLanguage; // Use inputLanguage instead of outputLanguage for consistency
     utterance.rate = 1.0;
     utterance.pitch = 1.0;
     utterance.volume = 1.0;
 
     // Get available voices and try to find a matching one
     const voices = speechSynthesisRef.current.getVoices();
-    const langCode = outputLanguage.split('-')[0]; // Get language code (e.g., 'hi' from 'hi-IN')
+    console.log('Total available voices:', voices.length);
+    
+    const langCode = inputLanguage.split('-')[0]; // Get language code (e.g., 'hi' from 'hi-IN')
     
     // Filter voices by language
     const langVoices = voices.filter(voice => 
       voice.lang.toLowerCase().startsWith(langCode.toLowerCase()) ||
       voice.lang.toLowerCase().includes(langCode.toLowerCase())
     );
+    
+    console.log(`Voices for ${langCode}:`, langVoices.length, langVoices.map(v => v.name));
     
     // Filter by gender preference
     // Voice names often contain gender indicators
@@ -626,10 +672,12 @@ function App() {
     // If no gender match, try any voice in the language
     if (!preferredVoice && langVoices.length > 0) {
       preferredVoice = langVoices[0];
+      console.log('Using first available voice for language');
     }
     
     // Fallback to any voice if no language match
     if (!preferredVoice && voices.length > 0) {
+      console.warn(`No ${langCode} voice found, trying gender preference from all voices`);
       // Try to find by gender in all voices
       preferredVoice = voices.find(voice => {
         const nameLower = voice.name.toLowerCase();
@@ -639,26 +687,30 @@ function App() {
       // Last resort: use default voice
       if (!preferredVoice) {
         preferredVoice = voices[0];
+        console.warn('Using default voice');
       }
     }
     
     if (preferredVoice) {
       utterance.voice = preferredVoice;
-      console.log('Using voice:', preferredVoice.name, preferredVoice.lang, 'Gender:', voiceGender);
+      console.log('✅ Using voice:', preferredVoice.name, '| Language:', preferredVoice.lang, '| Gender:', voiceGender);
     } else {
-      console.warn('No voice found for language:', outputLanguage, 'Available voices:', voices.map(v => v.lang));
+      console.error('❌ No voice found for language:', inputLanguage);
+      console.log('Available voices:', voices.map(v => `${v.name} (${v.lang})`));
     }
 
     utterance.onstart = () => {
+      console.log('🔊 Speech started');
       setIsSpeaking(true);
     };
 
     utterance.onend = () => {
+      console.log('✅ Speech ended');
       setIsSpeaking(false);
     };
 
     utterance.onerror = (event) => {
-      console.error('Speech synthesis error:', event);
+      console.error('❌ Speech synthesis error:', event);
       setIsSpeaking(false);
     };
 
@@ -677,12 +729,30 @@ function App() {
   useEffect(() => {
     if (recognitionRef.current) {
       recognitionRef.current.lang = inputLanguage;
+      console.log('Updated recognition language to:', inputLanguage);
+    }
+    
+    // Clear chat when language changes to reset the AI's language context
+    if (messages.length > 0) {
+      const confirmed = window.confirm('Language changed! Would you like to start a new conversation? (Recommended to ensure correct language response)');
+      if (confirmed) {
+        setMessages([]);
+        localStorage.removeItem(`chat_${sessionId}`);
+        console.log('Chat cleared due to language change');
+      }
     }
   }, [inputLanguage]);
 
-  const startVoiceInput = () => {
+  const startVoiceInput = async () => {
     if (!speechSupported) {
       alert('Voice input is not supported in this browser.\n\nPlease use:\n- Google Chrome\n- Microsoft Edge\n- Safari\n\nFirefox has limited support.');
+      return;
+    }
+
+    // Check if we're in a secure context
+    const isSecure = window.isSecureContext || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    if (!isSecure) {
+      alert('⚠️ Voice input requires a secure connection!\n\nPlease access this app via:\n- https:// (secure)\n- localhost\n- 127.0.0.1');
       return;
     }
 
@@ -690,6 +760,22 @@ function App() {
     if (!navigator.onLine) {
       alert('⚠️ No Internet Connection\n\nVoice input requires an internet connection because speech recognition is processed on remote servers.\n\nPlease:\n1. Check your internet connection\n2. Make sure you\'re connected to WiFi or mobile data\n3. Try again');
       return;
+    }
+
+    // Check microphone permission
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop()); // Stop the test stream
+      console.log('Microphone access granted');
+    } catch (error) {
+      console.error('Microphone permission error:', error);
+      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+        alert('🎤 Microphone Access Required\n\nPlease grant microphone permission:\n\n1. Click the 🔒 lock/camera icon in the address bar\n2. Find "Microphone" and set it to "Allow"\n3. Refresh the page (F5)\n4. Try again\n\nIf you don\'t see the option, you may have permanently blocked it. To reset:\n- Chrome: Settings → Privacy → Site Settings → Microphone\n- Edge: Settings → Cookies and site permissions → Microphone');
+        return;
+      } else if (error.name === 'NotFoundError') {
+        alert('⚠️ No Microphone Found\n\nPlease:\n1. Connect a microphone\n2. Check system settings\n3. Try again');
+        return;
+      }
     }
 
     if (recognitionRef.current && !isListening) {
@@ -704,10 +790,8 @@ function App() {
         if (error.message && error.message.includes('already started')) {
           // Already started, ignore
           console.log('Recognition already started');
-        } else if (error.message && error.message.includes('not allowed')) {
-          alert('Microphone access denied.\n\nPlease:\n1. Click the lock/padlock icon in your browser address bar\n2. Find "Microphone" and set it to "Allow"\n3. Refresh the page and try again');
         } else {
-          alert('Could not start voice recognition.\n\nPossible reasons:\n- Microphone not connected\n- Microphone permission denied\n- Browser not fully supported\n\nCheck the browser console (F12) for more details.');
+          alert('Could not start voice recognition.\n\nPossible reasons:\n- Browser not fully supported\n- Microphone not available\n\nCheck the browser console (F12) for more details.');
         }
       }
     } else {
@@ -769,6 +853,7 @@ function App() {
       }
       formData.append('sessionId', sessionId);
       formData.append('requestId', requestId);
+      formData.append('language', inputLanguage); // Send input language
 
       const response = await axios.post('/api/chat', formData, {
         headers: {
@@ -949,24 +1034,22 @@ function App() {
             </div>
           </div>
           <p>Upload images/files, ask questions, or use camera to capture images!</p>
+          {!speechSupported && (
+            <div style={{padding: '8px', background: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px', marginTop: '8px', fontSize: '13px'}}>
+              ⚠️ Voice input not supported. Use Chrome, Edge, or Safari.
+            </div>
+          )}
+          {speechSupported && !window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1' && (
+            <div style={{padding: '8px', background: '#f8d7da', border: '1px solid #f5c6cb', borderRadius: '4px', marginTop: '8px', fontSize: '13px'}}>
+              ⚠️ Voice input requires HTTPS. Access via https:// or localhost
+            </div>
+          )}
           <div className="language-controls">
             <div className="language-selector">
-              <label>Voice Input:</label>
+              <label>Language (Input & Output):</label>
               <select 
                 value={inputLanguage} 
                 onChange={(e) => setInputLanguage(e.target.value)}
-                className="language-select"
-              >
-                {Object.entries(languages).map(([code, lang]) => (
-                  <option key={code} value={code}>{lang.name}</option>
-                ))}
-              </select>
-            </div>
-            <div className="language-selector">
-              <label>Voice Output:</label>
-              <select 
-                value={outputLanguage} 
-                onChange={(e) => setOutputLanguage(e.target.value)}
                 className="language-select"
               >
                 {Object.entries(languages).map(([code, lang]) => (
@@ -1028,7 +1111,13 @@ function App() {
             <div className="camera-container">
               <video ref={cameraVideoRef} autoPlay playsInline className="camera-video"></video>
               <div className="camera-controls">
-                <button onClick={capturePhoto} className="capture-button">📷 Capture</button>
+                <button 
+                  onClick={capturePhoto} 
+                  className="capture-button"
+                  title="Take photo"
+                >
+                  📷 Capture
+                </button>
                 <button onClick={stopCamera} className="close-button">✕ Close</button>
               </div>
             </div>
